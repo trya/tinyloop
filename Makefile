@@ -4,13 +4,14 @@ LDLIBS  = -ltinyalsa -lpthread
 
 all: tinyloop alsalist
 
-tinyloop: main.o ringbuf.o
+tinyloop: tinyloop.o ringbuf.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tinyloop.o: tinyloop.c ringbuf.h
 
 alsalist: alsalist.c
 	$(CC) $(CFLAGS) -o $@ $^ -ltinyalsa
 
-main.o: main.c ringbuf.h
 ringbuf.o: ringbuf.c ringbuf.h
 
 .PHONY: all clean

@@ -17,6 +17,8 @@ static void sigint_handler(int s)
 }
 
 struct state {
+    const char *in_spec;
+    const char *out_spec;
     unsigned int in_card, in_dev;
     unsigned int out_card, out_dev;
     struct pcm_config cfg;
@@ -33,6 +35,7 @@ static void print_usage(const char *prog)
         "Options:\n"
         "  -i card:device   capture device (required)\n"
         "  -o card:device   playback device (required)\n"
+        "                   Run alsalist to discover card:device pairs.\n"
         "  -r rate          sample rate (default: 48000)\n"
         "  -c channels      channels (default: 2)\n"
         "  -p period_frames frames per period (default: 512)\n"
@@ -60,8 +63,7 @@ static int open_pcm_in(struct state *st)
     cfg.start_threshold = cfg.period_size / 2;
     st->pcm_in = pcm_open(st->in_card, st->in_dev, PCM_IN, &cfg);
     if (!st->pcm_in || !pcm_is_ready(st->pcm_in)) {
-        fprintf(stderr, "capture %u:%u: %s\n",
-                st->in_card, st->in_dev,
+        fprintf(stderr, "capture %s: %s\n", st->in_spec,
                 st->pcm_in ? pcm_get_error(st->pcm_in) : "pcm_open failed");
         return -1;
     }
@@ -76,8 +78,7 @@ static int open_pcm_out(struct state *st)
     cfg.start_threshold = cfg.period_size;
     st->pcm_out = pcm_open(st->out_card, st->out_dev, PCM_OUT, &cfg);
     if (!st->pcm_out || !pcm_is_ready(st->pcm_out)) {
-        fprintf(stderr, "playback %u:%u: %s\n",
-                st->out_card, st->out_dev,
+        fprintf(stderr, "playback %s: %s\n", st->out_spec,
                 st->pcm_out ? pcm_get_error(st->pcm_out) : "pcm_open failed");
         return -1;
     }
@@ -175,8 +176,14 @@ int main(int argc, char **argv)
 
     while ((opt = getopt(argc, argv, "i:o:r:c:p:n:h")) != -1) {
         switch (opt) {
-        case 'i': parse_pair(optarg, &st.in_card, &st.in_dev); got_i = 1; break;
-        case 'o': parse_pair(optarg, &st.out_card, &st.out_dev); got_o = 1; break;
+        case 'i': if (parse_pair(optarg, &st.in_card, &st.in_dev) < 0) {
+                      fprintf(stderr, "Invalid capture spec '%s' (use card:device)\n", optarg);
+                      return 1;
+                  } st.in_spec = optarg; got_i = 1; break;
+        case 'o': if (parse_pair(optarg, &st.out_card, &st.out_dev) < 0) {
+                      fprintf(stderr, "Invalid playback spec '%s' (use card:device)\n", optarg);
+                      return 1;
+                  } st.out_spec = optarg; got_o = 1; break;
         case 'r': rate = (unsigned int)atoi(optarg); break;
         case 'c': channels = (unsigned int)atoi(optarg); break;
         case 'p': period_size = (unsigned int)atoi(optarg); break;
