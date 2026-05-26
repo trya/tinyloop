@@ -20,6 +20,12 @@ ring buffer for reliable, low-latency operation.
 
     make
 
+## Install
+
+    make install                     # default: /usr/local/bin
+    make install PREFIX=/usr         # install to /usr/bin
+    make install DESTDIR=/tmp/pkg    # staged install (for packaging)
+
 ## Usage
 
 ### Discover devices

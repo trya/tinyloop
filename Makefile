@@ -14,6 +14,14 @@ alsalist: alsalist.c
 
 ringbuf.o: ringbuf.c ringbuf.h
 
-.PHONY: all clean
+PREFIX ?= /usr/local
+
+.PHONY: all clean install
+
+install: all
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 755 tinyloop $(DESTDIR)$(PREFIX)/bin/
+	install -m 755 alsalist $(DESTDIR)$(PREFIX)/bin/
+
 clean:
 	rm -f tinyloop alsalist *.o
