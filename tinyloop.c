@@ -16,6 +16,20 @@ static void sigint_handler(int s)
     running = 0;
 }
 
+static uint32_t iec958_encode(int16_t sample)
+{
+    /* left-justify 16-bit sample in 20-bit audio field (bits 4-23) */
+    uint32_t sf = (uint32_t)(uint16_t)sample << 4;
+    /* even parity over bits 4-30 */
+    uint32_t p = sf & 0x7FFFFFF0;
+    p ^= p >> 16;
+    p ^= p >> 8;
+    p ^= p >> 4;
+    p ^= p >> 2;
+    p ^= p >> 1;
+    return sf | ((p & 1) << 31);
+}
+
 struct state {
     const char *in_spec;
     const char *out_spec;
@@ -25,7 +39,9 @@ struct state {
     struct pcm *pcm_in;
     struct pcm *pcm_out;
     struct ringbuf *rb;
-    unsigned int bpf; /* bytes per frame */
+    unsigned int bpf; /* bytes per frame (S16_LE) */
+    int iec958;
+    enum pcm_format force_format;
 };
 
 static void print_usage(const char *prog)
@@ -36,6 +52,8 @@ static void print_usage(const char *prog)
         "  -i card:device   capture device (required)\n"
         "  -o card:device   playback device (required)\n"
         "                   Run alsalist to discover card:device pairs.\n"
+        "  -f format        force output format (S16_LE or IEC958)\n"
+        "                   default: auto-detect\n"
         "  -r rate          sample rate (default: 48000)\n"
         "  -c channels      channels (default: 2)\n"
         "  -p period_frames frames per period (default: 512)\n"
@@ -76,13 +94,37 @@ static int open_pcm_out(struct state *st)
         pcm_close(st->pcm_out);
     struct pcm_config cfg = st->cfg;
     cfg.start_threshold = cfg.period_size;
-    st->pcm_out = pcm_open(st->out_card, st->out_dev, PCM_OUT, &cfg);
-    if (!st->pcm_out || !pcm_is_ready(st->pcm_out)) {
-        fprintf(stderr, "playback %s: %s\n", st->out_spec,
-                st->pcm_out ? pcm_get_error(st->pcm_out) : "pcm_open failed");
-        return -1;
+
+    if (st->force_format != PCM_FORMAT_INVALID) {
+        cfg.format = st->force_format;
+        st->pcm_out = pcm_open(st->out_card, st->out_dev, PCM_OUT, &cfg);
+        if (!st->pcm_out || !pcm_is_ready(st->pcm_out)) {
+            fprintf(stderr, "playback %s: %s\n", st->out_spec,
+                    st->pcm_out ? pcm_get_error(st->pcm_out) : "pcm_open failed");
+            return -1;
+        }
+        st->iec958 = (cfg.format == PCM_FORMAT_IEC958_SUBFRAME_LE);
+        return 0;
     }
-    return 0;
+
+    cfg.format = PCM_FORMAT_S16_LE;
+    st->pcm_out = pcm_open(st->out_card, st->out_dev, PCM_OUT, &cfg);
+    if (st->pcm_out && pcm_is_ready(st->pcm_out)) {
+        st->iec958 = 0;
+        return 0;
+    }
+
+    cfg.format = PCM_FORMAT_IEC958_SUBFRAME_LE;
+    st->pcm_out = pcm_open(st->out_card, st->out_dev, PCM_OUT, &cfg);
+    if (st->pcm_out && pcm_is_ready(st->pcm_out)) {
+        st->iec958 = 1;
+        fprintf(stderr, "playback %s: using IEC958_SUBFRAME_LE\n", st->out_spec);
+        return 0;
+    }
+
+    fprintf(stderr, "playback %s: %s\n", st->out_spec,
+            st->pcm_out ? pcm_get_error(st->pcm_out) : "pcm_open failed");
+    return -1;
 }
 
 static void *capture_thread_fn(void *arg)
@@ -128,10 +170,14 @@ static void *playback_thread_fn(void *arg)
 {
     struct state *st = arg;
     unsigned int period_frames = st->cfg.period_size;
-    size_t period_bytes = period_frames * st->bpf;
-    void *buf = malloc(period_bytes);
-    if (!buf) {
+    size_t period_bytes = period_frames * st->bpf;  /* S16_LE */
+    size_t iec_bytes = period_frames * st->cfg.channels * 4;  /* IEC958 */
+    void *buf = malloc(iec_bytes > period_bytes ? iec_bytes : period_bytes);
+    void *iec_buf = st->iec958 ? malloc(iec_bytes) : NULL;
+    if (!buf || (st->iec958 && !iec_buf)) {
         fprintf(stderr, "playback: malloc failed\n");
+        free(buf);
+        free(iec_buf);
         return NULL;
     }
 
@@ -142,8 +188,18 @@ static void *playback_thread_fn(void *arg)
             continue;
         }
 
-        unsigned int frames = pcm_bytes_to_frames(st->pcm_out, (unsigned int)got);
-        int w = pcm_writei(st->pcm_out, buf, frames);
+        unsigned int frames = (unsigned int)(got / st->bpf);
+        const void *write_buf = buf;
+
+        if (st->iec958 && frames > 0) {
+            uint32_t *dst = iec_buf;
+            int16_t *src = buf;
+            for (unsigned int i = 0; i < frames * st->cfg.channels; i++)
+                dst[i] = iec958_encode(src[i]);
+            write_buf = iec_buf;
+        }
+
+        int w = pcm_writei(st->pcm_out, write_buf, frames);
         if (w == -EINTR)
             continue;
         if (w < 0) {
@@ -158,6 +214,7 @@ static void *playback_thread_fn(void *arg)
         }
     }
 
+    free(iec_buf);
     free(buf);
     return NULL;
 }
@@ -174,7 +231,9 @@ int main(int argc, char **argv)
     int got_i = 0, got_o = 0;
     int opt;
 
-    while ((opt = getopt(argc, argv, "i:o:r:c:p:n:h")) != -1) {
+    st.force_format = PCM_FORMAT_INVALID;
+
+    while ((opt = getopt(argc, argv, "i:o:r:c:p:n:f:h")) != -1) {
         switch (opt) {
         case 'i': if (parse_pair(optarg, &st.in_card, &st.in_dev) < 0) {
                       fprintf(stderr, "Invalid capture spec '%s' (use card:device)\n", optarg);
@@ -188,6 +247,15 @@ int main(int argc, char **argv)
         case 'c': channels = (unsigned int)atoi(optarg); break;
         case 'p': period_size = (unsigned int)atoi(optarg); break;
         case 'n': period_count = (unsigned int)atoi(optarg); break;
+        case 'f': if (strcmp(optarg, "S16_LE") == 0)
+                      st.force_format = PCM_FORMAT_S16_LE;
+                  else if (strcmp(optarg, "IEC958") == 0)
+                      st.force_format = PCM_FORMAT_IEC958_SUBFRAME_LE;
+                  else {
+                      fprintf(stderr, "Invalid format '%s' (use S16_LE or IEC958)\n", optarg);
+                      return 1;
+                  }
+                  break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
@@ -231,11 +299,12 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    printf("tinyloop: %u:%u -> %u:%u  %u Hz %u ch %u fps %u periods  buffer=%u rb=%zu\n",
+    printf("tinyloop: %u:%u -> %u:%u  %u Hz %u ch %u fps %u periods  buffer=%u rb=%zu  fmt=%s\n",
            st.in_card, st.in_dev, st.out_card, st.out_dev,
            rate, channels, period_size, period_count,
            period_size * period_count,
-           (size_t)(ringbuf_periods * period_size * st.bpf));
+           (size_t)(ringbuf_periods * period_size * st.bpf),
+           st.iec958 ? "IEC958" : "S16_LE");
 
     pthread_t capture_tid, playback_tid;
     pthread_create(&capture_tid, NULL, capture_thread_fn, &st);

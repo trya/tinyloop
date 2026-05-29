@@ -8,6 +8,25 @@
 static const unsigned int MAX_CARDS = 16;
 static const unsigned int MAX_DEVICES = 32;
 
+static int try_open(unsigned int card, unsigned int dev, unsigned int flags, struct pcm_config *cfg)
+{
+    struct pcm *pcm = pcm_open(card, dev, flags, cfg);
+    int ready = pcm && pcm_is_ready(pcm);
+    if (ready) { pcm_close(pcm); return 1; }
+
+    /* playback: retry with IEC958 when S16_LE fails (e.g. vc4-hdmi) */
+    if (!(flags & PCM_IN) && cfg->format == PCM_FORMAT_S16_LE) {
+        cfg->format = PCM_FORMAT_IEC958_SUBFRAME_LE;
+        pcm = pcm_open(card, dev, flags, cfg);
+        ready = pcm && pcm_is_ready(pcm);
+        cfg->format = PCM_FORMAT_S16_LE; /* restore */
+        if (ready) { pcm_close(pcm); return 1; }
+    }
+
+    if (pcm) pcm_close(pcm);
+    return 0;
+}
+
 static const char *read_proc_name(unsigned int card, unsigned int dev, int playback)
 {
     static char namebuf[256];
@@ -117,8 +136,7 @@ int main(int argc, char **argv)
         int card_has = 0;
         for (unsigned int dev = 0; dev < MAX_DEVICES; ++dev) {
             if (show_playback && pcm_direction_supported(card, dev, 1)) {
-                struct pcm *pcm = pcm_open(card, dev, PCM_OUT, &cfg);
-                int ready = pcm && pcm_is_ready(pcm);
+                int ready = try_open(card, dev, PCM_OUT, &cfg);
                 const char *name = read_proc_name(card, dev, 1);
 
                 if (csv) {
@@ -134,12 +152,10 @@ int main(int argc, char **argv)
                         printf("  device %u playback: in-use         - name: %s\n",
                                dev, name ? name : "(no name)");
                 }
-                if (pcm) pcm_close(pcm);
             }
 
             if (show_capture && pcm_direction_supported(card, dev, 0)) {
-                struct pcm *pcm = pcm_open(card, dev, PCM_IN, &cfg);
-                int ready = pcm && pcm_is_ready(pcm);
+                int ready = try_open(card, dev, PCM_IN, &cfg);
                 const char *name = read_proc_name(card, dev, 0);
 
                 if (csv) {
@@ -155,7 +171,6 @@ int main(int argc, char **argv)
                         printf("  device %u capture:  in-use         - name: %s\n",
                                dev, name ? name : "(no name)");
                 }
-                if (pcm) pcm_close(pcm);
             }
         }
     }

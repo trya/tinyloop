@@ -1,3 +1,5 @@
 tinyloop
 alsalist
 *.o
+tinyalsa/*.o
+tinyalsa/libtinyalsa.a

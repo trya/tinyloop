@@ -1,16 +1,29 @@
 CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -O2
-LDLIBS  = -ltinyalsa -lpthread
+
+TINYALSA_DIR   = tinyalsa
+TINYALSA_SRC   = $(TINYALSA_DIR)/src/pcm.c $(TINYALSA_DIR)/src/pcm_hw.c
+TINYALSA_OBJ   = $(TINYALSA_SRC:.c=.o)
+TINYALSA_LIB   = $(TINYALSA_DIR)/libtinyalsa.a
+TINYALSA_CFLAGS = -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 
 all: tinyloop alsalist
 
-tinyloop: tinyloop.o ringbuf.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+$(TINYALSA_OBJ): %.o: %.c
+	$(CC) $(CFLAGS) $(TINYALSA_CFLAGS) -c -o $@ $<
+
+$(TINYALSA_LIB): $(TINYALSA_OBJ)
+	$(AR) rcs $@ $^
+
+tinyloop: CFLAGS += -I$(TINYALSA_DIR)/include
+tinyloop: tinyloop.o ringbuf.o $(TINYALSA_LIB)
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread
 
 tinyloop.o: tinyloop.c ringbuf.h
 
-alsalist: alsalist.c
-	$(CC) $(CFLAGS) -o $@ $^ -ltinyalsa
+alsalist: CFLAGS += -I$(TINYALSA_DIR)/include
+alsalist: alsalist.c $(TINYALSA_LIB)
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread
 
 ringbuf.o: ringbuf.c ringbuf.h
 
@@ -24,4 +37,4 @@ install: all
 	install -m 755 alsalist $(DESTDIR)$(PREFIX)/bin/
 
 clean:
-	rm -f tinyloop alsalist *.o
+	rm -f tinyloop alsalist *.o $(TINYALSA_OBJ) $(TINYALSA_LIB)
