@@ -247,28 +247,80 @@ static void *playback_thread_fn(void *arg)
     struct iec958_enc enc_st;
     iec958_enc_init(&enc_st, st->cfg.rate);
 
-    /* Prime the DMA buffer: write a buffer-full of silent IEC958 frames.
-     * This gives the HDMI Audio InfoFrame time to be sent (scheduled during
-     * prepare for the next VSYNC, up to 16.7ms at 60Hz) before real audio
-     * data arrives at the sink. Without this, the sink may drop the first
-     * audio packets when they arrive before the InfoFrame. */
-    if (st->iec958) {
+    /* Prime the DMA buffer: write a buffer-full of (mostly) silent frames.
+     * The first 256 frames include a soft-start ramp (sample 0→1→0) at
+     * —90 dBFS to settle the HDMI sink's DAC, followed by true silence.
+     * This also gives the Audio InfoFrame time to be sent (scheduled during
+     * prepare for the next VSYNC) before real audio arrives. */
+    {
         unsigned int prime_frames = st->cfg.period_size * st->cfg.period_count;
-        size_t prime_bytes = prime_frames * st->cfg.channels * 4;
-        uint32_t *prime_buf = malloc(prime_bytes);
-        if (prime_buf) {
-            for (unsigned int i = 0; i < prime_frames; i++)
-                for (unsigned int c = 0; c < st->cfg.channels; c++)
-                    prime_buf[i * st->cfg.channels + c] =
-                        iec958_subframe(&enc_st, 0, c);
-            int pw = pcm_writei(st->pcm_out, prime_buf, prime_frames);
-            (void)pw;
-            free(prime_buf);
+        unsigned int soft_len = 256;
+        if (soft_len > prime_frames) soft_len = prime_frames;
+        void *prime_buf;
+        size_t prime_bytes;
+        if (st->iec958) {
+            prime_bytes = prime_frames * st->cfg.channels * 4;
+            prime_buf = malloc(prime_bytes);
+            if (prime_buf) {
+                uint32_t *dst = prime_buf;
+                for (unsigned int i = 0; i < prime_frames; i++) {
+                    int16_t s = 0;
+                    if (i * 2 < soft_len)
+                        s = (int16_t)((int32_t)i * 2 / (int32_t)soft_len);
+                    else if (i < soft_len)
+                        s = (int16_t)((int32_t)(soft_len - i) * 2 / (int32_t)soft_len);
+                    for (unsigned int c = 0; c < st->cfg.channels; c++)
+                        *dst++ = iec958_subframe(&enc_st, s, c);
+                }
+                int pw = pcm_writei(st->pcm_out, prime_buf, prime_frames);
+                (void)pw;
+                free(prime_buf);
+            }
+        } else {
+            prime_bytes = prime_frames * st->bpf;
+            prime_buf = malloc(prime_bytes);
+            if (prime_buf) {
+                int16_t *dst = prime_buf;
+                for (unsigned int i = 0; i < prime_frames; i++) {
+                    int16_t s = 0;
+                    if (i * 2 < soft_len)
+                        s = (int16_t)((int32_t)i * 2 / (int32_t)soft_len);
+                    else if (i < soft_len)
+                        s = (int16_t)((int32_t)(soft_len - i) * 2 / (int32_t)soft_len);
+                    for (unsigned int c = 0; c < st->cfg.channels; c++)
+                        *dst++ = s;
+                }
+                int pw = pcm_writei(st->pcm_out, prime_buf, prime_frames);
+                (void)pw;
+                free(prime_buf);
+            }
         }
     }
 
+    uint32_t fade_pos = 0;
+    uint32_t fade_len = 4096;
+
     while (running) {
         size_t got = ringbuf_read(st->rb, buf, period_bytes);
+
+        if (got == 0 && fade_pos < fade_len) {
+            /* Ringbuffer empty during fade-in: write silence to avoid underrun */
+            if (st->iec958) {
+                uint32_t *silence = buf;
+                for (unsigned int i = 0; i < period_frames; i++)
+                    for (unsigned int c = 0; c < st->cfg.channels; c++)
+                        silence[i * st->cfg.channels + c] =
+                            iec958_subframe(&enc_st, 0, c);
+                int pw = pcm_writei(st->pcm_out, silence, period_frames);
+                (void)pw;
+            } else {
+                memset(buf, 0, period_bytes);
+                int pw = pcm_writei(st->pcm_out, buf, period_frames);
+                (void)pw;
+            }
+            continue;
+        }
+
         if (got == 0) {
             usleep(2000);
             continue;
@@ -276,6 +328,20 @@ static void *playback_thread_fn(void *arg)
 
         unsigned int frames = (unsigned int)(got / st->bpf);
         const void *write_buf = buf;
+
+        /* Fade-in to smooth the DAC idle→active transition */
+        if (fade_pos < fade_len && frames > 0) {
+            uint32_t end = fade_pos + frames;
+            if (end > fade_len) end = fade_len;
+            for (uint32_t i = fade_pos; i < end; i++) {
+                int32_t gain_num = (int32_t)i;
+                for (unsigned int c = 0; c < st->cfg.channels; c++) {
+                    int16_t *s = &((int16_t *)buf)[(i - fade_pos) * st->cfg.channels + c];
+                    *s = (int16_t)((int32_t)*s * gain_num / (int32_t)fade_len);
+                }
+            }
+            fade_pos = end;
+        }
 
         if (st->iec958 && frames > 0) {
             uint32_t *dst = iec_buf;
