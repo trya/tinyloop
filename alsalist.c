@@ -57,7 +57,7 @@ static int pcm_direction_supported(unsigned int card, unsigned int dev, int play
         while ((p = strstr(p, needle)) != NULL) {
             p += strlen(needle);
             while (*p == ' ') p++;
-            if (*p == '1') {
+            if (*p >= '1' && *p <= '9') {
                 supported = 1;
                 break;
             }
