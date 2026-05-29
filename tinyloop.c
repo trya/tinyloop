@@ -16,18 +16,81 @@ static void sigint_handler(int s)
     running = 0;
 }
 
-static uint32_t iec958_encode(int16_t sample)
+struct iec958_enc {
+    unsigned int counter;  /* frame counter 0-191 */
+    unsigned char status[24];
+    unsigned char preamble[3]; /* Z/X/Y */
+};
+
+static void iec958_enc_init(struct iec958_enc *e, unsigned int rate)
 {
-    /* left-justify 16-bit sample in 20-bit audio field (bits 4-23) */
-    uint32_t sf = (uint32_t)(uint16_t)sample << 4;
+    e->counter = 0;
+    memset(e->status, 0, sizeof(e->status));
+    /* status[0]: consumer, audio, not-copyright, no emphasis */
+    e->status[0] = 0x0C;
+    /* status[1]: general category */
+    e->status[1] = 0x00;
+    /* status[2]: source/channel unspecified */
+
+    /* status[3]: sample rate in upper nibble, clock accuracy level II (1000 ppm) */
+    e->status[3] = 0x00;
+
+    /* status[4]: 20/16-bit word length */
+    e->status[4] = 0x08;
+
+    {
+        static const struct { unsigned int rate; unsigned char val; } fs_tab[] = {
+            { 32000,  0x30 }, { 44100,  0x00 }, { 48000,  0x20 },
+            { 88200,  0x80 }, { 96000,  0xA0 }, { 176400, 0xC0 },
+            { 192000, 0xE0 }, { 22050,  0x40 }, { 24000,  0x60 },
+            { 128000, 0x80 }, { 384000, 0x50 }, { 768000, 0x90 },
+            { 705600, 0xD0 },
+        };
+        for (size_t i = 0; i < sizeof(fs_tab)/sizeof(fs_tab[0]); i++)
+            if (fs_tab[i].rate == rate) {
+                e->status[3] |= fs_tab[i].val;
+                break;
+            }
+    }
+
+    e->preamble[0] = 0x08; /* Z (block start) */
+    e->preamble[1] = 0x02; /* X (even subframe) */
+    e->preamble[2] = 0x04; /* Y (odd subframe) */
+}
+
+static uint32_t iec958_subframe(struct iec958_enc *e, int16_t sample, int channel)
+{
+    /* left-justify 16-bit sample in 24-bit audio field (bits 12-27) */
+    uint32_t sf = (uint32_t)(uint16_t)sample << 12;
+
+    /* bit 30: channel status (one bit per subframe, 192 bits total) */
+    {
+        unsigned int byte = e->counter >> 3;
+        unsigned int mask = 1 << (e->counter - (byte << 3));
+        if (e->status[byte] & mask)
+            sf |= 0x40000000;
+    }
+
     /* even parity over bits 4-30 */
-    uint32_t p = sf & 0x7FFFFFF0;
-    p ^= p >> 16;
-    p ^= p >> 8;
-    p ^= p >> 4;
-    p ^= p >> 2;
-    p ^= p >> 1;
-    return sf | ((p & 1) << 31);
+    {
+        uint32_t p = sf & 0x7FFFFFF0;
+        p ^= p >> 16;
+        p ^= p >> 8;
+        p ^= p >> 4;
+        p ^= p >> 2;
+        p ^= p >> 1;
+        sf |= (p & 1) << 31;
+    }
+
+    /* preamble in bits 0-3 */
+    if (channel)
+        sf |= e->preamble[2];  /* Y: odd subframe */
+    else if (!e->counter)
+        sf |= e->preamble[0];  /* Z: block start */
+    else
+        sf |= e->preamble[1];  /* X: even subframe */
+
+    return sf;
 }
 
 struct state {
@@ -181,6 +244,29 @@ static void *playback_thread_fn(void *arg)
         return NULL;
     }
 
+    struct iec958_enc enc_st;
+    iec958_enc_init(&enc_st, st->cfg.rate);
+
+    /* Prime the DMA buffer: write a buffer-full of silent IEC958 frames.
+     * This gives the HDMI Audio InfoFrame time to be sent (scheduled during
+     * prepare for the next VSYNC, up to 16.7ms at 60Hz) before real audio
+     * data arrives at the sink. Without this, the sink may drop the first
+     * audio packets when they arrive before the InfoFrame. */
+    if (st->iec958) {
+        unsigned int prime_frames = st->cfg.period_size * st->cfg.period_count;
+        size_t prime_bytes = prime_frames * st->cfg.channels * 4;
+        uint32_t *prime_buf = malloc(prime_bytes);
+        if (prime_buf) {
+            for (unsigned int i = 0; i < prime_frames; i++)
+                for (unsigned int c = 0; c < st->cfg.channels; c++)
+                    prime_buf[i * st->cfg.channels + c] =
+                        iec958_subframe(&enc_st, 0, c);
+            int pw = pcm_writei(st->pcm_out, prime_buf, prime_frames);
+            (void)pw;
+            free(prime_buf);
+        }
+    }
+
     while (running) {
         size_t got = ringbuf_read(st->rb, buf, period_bytes);
         if (got == 0) {
@@ -194,8 +280,13 @@ static void *playback_thread_fn(void *arg)
         if (st->iec958 && frames > 0) {
             uint32_t *dst = iec_buf;
             int16_t *src = buf;
-            for (unsigned int i = 0; i < frames * st->cfg.channels; i++)
-                dst[i] = iec958_encode(src[i]);
+            unsigned int ch = st->cfg.channels;
+            for (unsigned int i = 0; i < frames; i++) {
+                for (unsigned int c = 0; c < ch; c++)
+                    dst[i * ch + c] = iec958_subframe(&enc_st, src[i * ch + c], c);
+                enc_st.counter++;
+                enc_st.counter %= 192;
+            }
             write_buf = iec_buf;
         }
 
